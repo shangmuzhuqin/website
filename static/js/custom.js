@@ -3,9 +3,12 @@ $(document).ready(function() {
   var chatBtn = $('#chatBtn');
   var chatInput = $('#chatInput');
   var chatWindow = $('#chatWindow');
-  
-  // 全局变量,存储对话信息
+
+  // 存储对话信息,实现连续对话
   var messages = [];
+
+  // 检查返回的信息是否是正确信息
+  var resFlag = true
 
   // 创建自定义渲染器
   const renderer = new marked.Renderer();
@@ -26,6 +29,7 @@ $(document).ready(function() {
     }
   });
 
+
   // 转义html代码(对应字符转移为html实体)，防止在浏览器渲染
   function escapeHtml(html) {
     let text = document.createTextNode(html);
@@ -33,7 +37,6 @@ $(document).ready(function() {
     div.appendChild(text);
     return div.innerHTML;
   }
-
   
   // 添加请求消息到窗口
   function addRequestMessage(message) {
@@ -47,7 +50,6 @@ $(document).ready(function() {
     chatWindow.scrollTop(chatWindow.prop('scrollHeight'));
   }
   
-
   // 添加响应消息到窗口,流式响应此方法会执行多次
   function addResponseMessage(message) {
     let lastResponseElement = $(".message-bubble .response").last();
@@ -57,8 +59,8 @@ $(document).ready(function() {
     let codeMarkCount = 0;
     let index = message.indexOf('```');
     while (index !== -1) {
-      codeMarkCount ++ ;
-      index = message.indexOf('```', index + 3);
+        codeMarkCount ++ ;
+        index = message.indexOf('```', index + 3);
     }
     if(codeMarkCount % 2 == 1  ){  // 有未闭合的 code
       escapedMessage = marked.parse(message + '\n\n```'); 
@@ -80,29 +82,83 @@ $(document).ready(function() {
     messages.pop() // 失败就让用户输入信息从数组删除
   }
   
+
+  // 发送请求获得响应
+  async function sendRequest(data) {
+    const response = await fetch(config.url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Bearer ' + data.apiKey
+      },
+      body: JSON.stringify({
+        "messages": data.prompts,
+        "model": "gpt-3.5-turbo",
+        "max_tokens": 1025,
+        "temperature": 0.5,
+        "top_p": 1,
+        "n": 1,
+        "stream": true
+      })
+    }); 
+  
+    const reader = response.body.getReader();
+    let res = '';
+    let str;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      str = '';
+      res += new TextDecoder().decode(value).replace(/^data: /gm, '').replace("[DONE]",'');
+      const lines = res.trim().split(/[\n]+(?=\{)/);
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        let jsonObj;
+        try{
+          jsonObj = JSON.parse(line);
+        }catch(e){
+          break;
+        }
+        if (jsonObj.choices && jsonObj.choices[0].delta.content) {
+          str += jsonObj.choices[0].delta.content;
+          addResponseMessage(str);
+          resFlag = true;
+        }else{
+          if(jsonObj.error){
+            addFailMessage(jsonObj.error.type + " : " + jsonObj.error.message + jsonObj.error.code);
+            resFlag = false;
+          }
+        } 
+      }
+    }
+    return str;
+  }
+
   // 处理用户输入
   chatBtn.click(function() {
     // 解绑键盘事件
     chatInput.off("keydown",handleEnter);
     
-    // ajax上传数据
-    let data = {};
-
-    // 判断消息是否是正常的标志变量
-    let resFlag = true;
+    // 保存api key与对话数据
+    let data;
+    if(config.apiKey !== ''){
+      data = { "apiKey": atob(config.apiKey)}; 
+    }else{
+      data = { "apiKey": ""};
+    }
    
-    // 判断是否使用自己的api key
     let apiKey = localStorage.getItem('apiKey');
     if (apiKey){
       data.apiKey = apiKey;
     }
 
-    // 接收输入信息变量
     let message = chatInput.val();
     if (message.length == 0){
       // 重新绑定键盘事件
       chatInput.on("keydown",handleEnter);
-      return ;
+      return
     }
 
     addRequestMessage(message);
@@ -118,10 +174,10 @@ $(document).ready(function() {
       chatBtn.attr('disabled',false) // 让按钮可点击
       return ;
     }
-    
+
     // 判读是否已开启连续对话
     if(localStorage.getItem('continuousDialogue') == 'true'){
-      // 控制上下文，对话长度超过4轮，取最新的3轮,即数组最后7条数据
+        // 控制上下文，对话长度超过4轮，取最新的3轮,即数组最后7条数据
       data.prompts = messages.slice();  // 拷贝一份全局messages赋值给data.prompts,然后对data.prompts处理
       if (data.prompts.length > 8) {
         data.prompts.splice(0, data.prompts.length - 7);
@@ -130,53 +186,25 @@ $(document).ready(function() {
       data.prompts = messages.slice();
       data.prompts.splice(0, data.prompts.length - 1); // 未开启连续对话，取最后一条
     }
-    data.prompts = JSON.stringify(data.prompts);
-    
-    // 发送信息到后台
-    $.ajax({
-      url: '/chat',
-      method: 'POST',
-      data: data,
-      xhrFields: {
-        onprogress: function(e) {
-          let res = e.target.responseText;
-          let resJsonObj;
-          try{
-            resJsonObj = JSON.parse(res);  // 只有错误信息是json类型字符串,且一次返回
-            if(resJsonObj.hasOwnProperty("error")){
-              addFailMessage(resJsonObj.error.type + " : " + resJsonObj.error.message + resJsonObj.error.code);
-              resFlag = false;
-            }else{
-              addResponseMessage(res);
-            }
-          }catch(e){
-            addResponseMessage(res);
-          }
+      
+    sendRequest(data).then((res) => {
+      chatInput.val('');
+      // 收到回复，让按钮可点击
+      chatBtn.attr('disabled',false)
+      // 重新绑定键盘事件
+      chatInput.on("keydown",handleEnter); 
+      // 判断是否是回复正确信息
+      if(resFlag){
+        messages.push({"role": "assistant", "content": res});
+        // 判断是否本地存储历史会话
+        if(localStorage.getItem('archiveSession')=="true"){
+          localStorage.setItem("session",JSON.stringify(messages));
         }
-      },
-      success:function(res){
-        // 判断是否是回复正确信息
-        if(resFlag){
-          messages.push({"role": "assistant", "content": res});
-          // 判断是否本地存储历史会话
-          if(localStorage.getItem('archiveSession')=="true"){
-            localStorage.setItem("session",JSON.stringify(messages));
-          }
-        }
-        // 添加复制
-        copy();
-      },
-      error: function(jqXHR, textStatus, errorThrown) {
-        addFailMessage('出错啦！请稍后再试!');
-      },
-      complete : function(XMLHttpRequest,status){
-        // 收到回复，让按钮可点击
-        chatBtn.attr('disabled',false)
-        // 重新绑定键盘事件
-        chatInput.on("keydown",handleEnter); 
       }
+      // 添加复制
+      copy();
     });
-  });
+  });  
 
   // Enter键盘事件
   function handleEnter(e){
@@ -188,6 +216,7 @@ $(document).ready(function() {
 
   // 绑定Enter键盘事件
   chatInput.on("keydown",handleEnter);
+
 
   // 设置栏宽度自适应
   let width = $('.function .others').width();
@@ -226,7 +255,7 @@ $(document).ready(function() {
     $('.settings-common').css('background-color', 'var(--bg-color)');
   });
 
-  // 读取apiKey
+  // apiKey
   const apiKey = localStorage.getItem('apiKey');
   if (apiKey) {
     $(".settings-common .api-key").val(apiKey);
@@ -305,9 +334,9 @@ $(document).ready(function() {
 
   $('#chck-2').click(function() {
     if ($(this).prop('checked')) {
-       localStorage.setItem('continuousDialogue', true);
+      localStorage.setItem('continuousDialogue', true);
     } else {
-       localStorage.setItem('continuousDialogue', false);
+      localStorage.setItem('continuousDialogue', false);
     }
   });
 
@@ -366,7 +395,7 @@ $(document).ready(function() {
         $(this).find('.copy-btn').hide();
       }
     );
-
+  
     $('pre').on('click', '.copy-btn', function() {
       let text = $(this).siblings('code').text();
       // 创建一个临时的 textarea 元素
@@ -393,4 +422,16 @@ $(document).ready(function() {
       }, 2000);
     });
   }
+
+  // 禁用右键菜单
+  document.addEventListener('contextmenu',function(e){
+    e.preventDefault();  // 阻止默认事件
+  });
+
+  // 禁止键盘F12键
+  document.addEventListener('keydown',function(e){
+    if(e.key == 'F12'){
+        e.preventDefault(); // 如果按下键F12,阻止事件
+    }
+  });
 });
